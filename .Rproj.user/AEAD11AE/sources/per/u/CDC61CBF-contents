@@ -1,4 +1,0 @@
-library(tidyverse)
-library(readxl)
-
-raw <- read_excel('ignore/UNIQUES FOR  ASSESSMENT_comp_2018_v3.xls')
