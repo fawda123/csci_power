@@ -1,9 +1,8 @@
 library(tidyverse)
 library(readxl)
 library(nlme)
-
-fls <- list.files('R', full.names = T)
-sapply(fls, source)
+library(doParallel)
+library(foreach)
 
 # raw <- read_excel("ignore/csci_raw.xlsx")
 # save(raw, file = 'data/raw.RData', compress = 'xz')
@@ -13,66 +12,83 @@ data(raw)
 # format raw data for power analysis, CSCI
 topow <- raw %>% 
   select(MasterID, FieldReplicate, SampleYear, CSCI) %>% 
-  filter(SampleYear >= 2008) %>% 
+  filter(SampleYear >= 2008 & SampleYear <= 2015) %>% 
   filter(!is.na(CSCI)) %>% 
-  mutate(SampleYear = as.character(SampleYear))
+  mutate(yrno = SampleYear - min(SampleYear))
 
-# tmp <- topow %>% 
-#   group_by(MasterID) %>% 
+# tmp <- topow %>%
+#   group_by(MasterID) %>%
 #   mutate(n = n())
 # 
-# ggplot(tmp, aes(x = n)) + 
+# ggplot(tmp, aes(x = n)) +
 #   geom_bar()
 
 ## 
 # input for function
 
-# indicator name
-indicator <- 'CSCI'
+# input mixed model
+mod <- lme(CSCI ~ yrno, random = ~ 1 | MasterID, data = topow)
 
-# mean of indicator
-ind.mean <- topow$CSCI %>% 
-  mean(na.rm = T)
+scns <- crossing(
+  nsite = c(15, 30, 60),
+  dec = seq(0.01, 0.05, length = 5),
+  L = 10:35,
+  s.freq = 1:2
+  )
 
-# power to detect trend of x percent
-trend <- 2 
+library(doParallel)
+ncores <- detectCores() - 1  
 
-# nsites - number of sites visited each year
-# a matrix where number of rows is number of rows is number of indicators
-# number of columns is number of years
-# each cell is number of sites to visit in a year
-# this is 30 sites visited every year
-# skipped years should be zero
-nyr <- 34 # up to 2050 (from 2016)
-nsites1 <- matrix(rep(60, nyr), nrow = 1, ncol = nyr)
-nsites2 <- matrix(rep(c(50, 0), times = 10), nrow = 1, ncol = 20)
-nsites3 <- matrix(rep(c(30, 0), times = nyr), nrow = 1, ncol = nyr)
-nsites4 <- matrix(rep(c(1, 1), times = nyr), nrow = 1, ncol = nyr)
-nsites <- rbind(nsites1, nsites2, nsites3, nsites4)
+# setup parallel backend
+cl<-makeCluster(ncores)
+registerDoParallel(cl)
+strt<-Sys.time()
 
-# number of repeats per year (one)
-nrepeats <- 1
+# process all stations
+res <- foreach(i = 1:nrow(scns), .packages = 'nlme') %dopar% {
+  
+  sink('log.txt')
+  cat(i, 'of', nrow(scns), '\n')
+  print(Sys.time()-strt)
+  sink()
+  
+  source("R/funcs.R")
+  
+  dec <- scns[i, ][['dec']]
+  nsite <- scns[i,][['nsite']]
+  L <- scns[i, ][['L']]
+  s.freq <- scns[i, ][['s.freq']]
+  
+  power.fun(mod, dec = dec, s.freq = s.freq, nsite = nsite, L = L, boot.num = 2000)
 
-##
-# variance components of sites
+}
+save(res, file = 'data/res.RData', compress = 'xz')  
+pows <- lapply(res, function(x) x$p.boot) %>% unlist
 
-mod <- lme(CSCI ~ SampleYear, random = ~ 1 | MasterID, data = topow)
-tot.var <- var(topow$CSCI)
+toplo <- scns %>% 
+  mutate(
+    pow = 100 * pows,
+    dec = factor(dec, levels = seq(0.01, 0.05, length = 5), labels = paste(seq(1, 5, length = 5), '%')), 
+    L = 2015 + L, 
+    nsite = paste(nsite, 'sites'), 
+    s.freq = factor(s.freq, levels = c(1, 2), labels = c('annual', 'biennial'))
+    )
 
-year.var <- mod$sigma^2
-index.var <- var(resid(mod))
-site.var <- tot.var - year.var - index.var
+p <- ggplot(toplo, aes(x = L, y = pow, group = dec, colour = factor(dec))) +
+  # geom_line() +
+  geom_point(colour = NA, guide = F) +
+  geom_smooth(se = F) +
+  facet_grid(s.freq ~ nsite) +
+  theme_bw(base_family = 'serif') +
+  scale_y_continuous('Power') +
+  scale_colour_manual('Trend', values = RColorBrewer::brewer.pal(9, 'Reds')[4:9]) +
+  theme(
+    strip.background = element_blank(), 
+    legend.position = 'top', 
+    axis.title.x = element_blank(), 
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
 
-power.fcn(indicator = 'CSCI', 
-          ind.mean = ind.mean, 
-          trend = trend,
-          nsites = nsites2, 
-          nrepeats = 1, 
-          site.var = site.var, 
-          year.var = year.var, 
-          siteyear.var = 0, 
-          index.var = index.var, 
-          site.rho = 1, 
-          year.rho = 0, 
-          alfa = 0.05, 
-          plot.ind = T)
+png('power.png', height = 6, width = 8, units = 'in', res = 400)
+p
+dev.off()
